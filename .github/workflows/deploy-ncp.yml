@@ -1,0 +1,126 @@
+name: Deploy to NCP Server
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+    types: [ closed ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || (github.event.pull_request.merged == true)
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Run linting
+      run: npm run lint
+
+    - name: Build application
+      run: npm run build
+
+    - name: Build Docker image
+      run: |
+        docker build -t my-app:${{ github.sha }} .
+        docker tag my-app:${{ github.sha }} my-app:latest
+
+    - name: Save Docker image
+      run: |
+        docker save my-app:latest | gzip > my-app-latest.tar.gz
+
+    - name: Deploy to NCP Server
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.NCP_SERVER_HOST }}
+        username: ${{ secrets.NCP_SERVER_USER }}
+        key: ${{ secrets.NCP_SERVER_KEY }}
+        port: 22
+        script: |
+          # 기존 컨테이너 중지 및 제거
+          sudo docker stop my-app || true
+          sudo docker rm my-app || true
+          sudo docker rmi my-app:latest || true
+          
+          # 새 이미지 다운로드 및 실행
+          cd /opt/my-app
+          sudo docker run -d \
+            --name my-app \
+            --restart unless-stopped \
+            -p 3000:3000 \
+            -e NODE_ENV=production \
+            my-app:latest
+          
+          # 컨테이너 상태 확인
+          sleep 5
+          sudo docker ps | grep my-app
+          
+          # 헬스 체크
+          curl -f http://localhost:3000/api/health || exit 1
+          
+          echo "✅ 배포 완료!"
+
+    - name: Copy Docker image to server
+      uses: appleboy/scp-action@v0.1.7
+      with:
+        host: ${{ secrets.NCP_SERVER_HOST }}
+        username: ${{ secrets.NCP_SERVER_USER }}
+        key: ${{ secrets.NCP_SERVER_KEY }}
+        port: 22
+        source: "my-app-latest.tar.gz"
+        target: "/opt/my-app/"
+
+    - name: Load and run Docker image
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.NCP_SERVER_HOST }}
+        username: ${{ secrets.NCP_SERVER_USER }}
+        key: ${{ secrets.NCP_SERVER_KEY }}
+        port: 22
+        script: |
+          cd /opt/my-app
+          
+          # Docker 이미지 로드
+          sudo docker load < my-app-latest.tar.gz
+          
+          # 기존 컨테이너 중지
+          sudo docker stop my-app || true
+          sudo docker rm my-app || true
+          
+          # 새 컨테이너 실행
+          sudo docker run -d \
+            --name my-app \
+            --restart unless-stopped \
+            -p 3000:3000 \
+            -e NODE_ENV=production \
+            my-app:latest
+          
+          # 정리
+          rm -f my-app-latest.tar.gz
+          sudo docker image prune -f
+          
+          # 배포 확인
+          sleep 10
+          curl -f http://localhost:3000/api/health
+          
+          echo "🎉 배포 성공! http://175.45.193.234:3000"
+
+    - name: Notify deployment status
+      if: always()
+      run: |
+        if [ ${{ job.status }} == 'success' ]; then
+          echo "✅ 배포 성공: http://175.45.193.234:3000"
+        else
+          echo "❌ 배포 실패"
+        fi
