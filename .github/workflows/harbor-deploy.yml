@@ -1,0 +1,111 @@
+name: Build and Deploy to Harbor + NCP
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+    types: [ closed ]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event.pull_request.merged == true
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Run tests and linting
+      run: |
+        npm run lint
+        # npm run test  # 테스트가 있다면
+
+    - name: Build application
+      run: npm run build
+
+    - name: Login to Harbor
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ secrets.HARBOR_REGISTRY }}  # 175.45.193.234
+        username: ${{ secrets.HARBOR_USERNAME }}  # admin
+        password: ${{ secrets.HARBOR_PASSWORD }}  # Harbor12345
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ secrets.HARBOR_REGISTRY }}/my-app/nextjs-app
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=sha,prefix={{branch}}-
+          type=raw,value=latest
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Deploy to NCP Server
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.NCP_SERVER_HOST }}    # 175.45.193.234
+        username: ${{ secrets.NCP_SERVER_USER }} # ubuntu
+        key: ${{ secrets.NCP_SERVER_KEY }}
+        script: |
+          # Harbor에 로그인
+          echo "${{ secrets.HARBOR_PASSWORD }}" | docker login ${{ secrets.HARBOR_REGISTRY }} -u ${{ secrets.HARBOR_USERNAME }} --password-stdin
+          
+          # 최신 이미지 가져오기
+          docker pull ${{ secrets.HARBOR_REGISTRY }}/my-app/nextjs-app:latest
+          
+          # 기존 컨테이너 중지 및 제거
+          docker stop my-nextjs-app || true
+          docker rm my-nextjs-app || true
+          
+          # 새 컨테이너 실행
+          docker run -d \
+            --name my-nextjs-app \
+            --restart unless-stopped \
+            -p 3000:3000 \
+            -e NODE_ENV=production \
+            ${{ secrets.HARBOR_REGISTRY }}/my-app/nextjs-app:latest
+          
+          # 컨테이너 상태 확인
+          docker ps | grep my-nextjs-app
+          
+          # 헬스 체크
+          sleep 10
+          curl -f http://localhost:3000/api/health || curl -f http://localhost:3000
+          
+          # 이전 이미지 정리
+          docker image prune -f
+          
+          echo "✅ Harbor에서 배포 완료!"
+
+    - name: Notify deployment status
+      if: always()
+      run: |
+        if [ ${{ job.status }} == 'success' ]; then
+          echo "🎉 Harbor 배포 성공!"
+          echo "Registry: ${{ secrets.HARBOR_REGISTRY }}/my-app/nextjs-app:latest"
+          echo "Server: http://${{ secrets.NCP_SERVER_HOST }}"
+        else
+          echo "❌ 배포 실패"
+        fi

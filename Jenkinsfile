@@ -3,7 +3,7 @@ pipeline {
     
     environment {
         // Docker Hub 또는 Private Registry 설정
-        DOCKER_REGISTRY = 'your-registry.com'
+        DOCKER_REGISTRY = 'jiyoon3421/my-app'
         DOCKER_REPO = 'my-app'
         DOCKER_CREDENTIALS_ID = 'docker-hub-credentials'
         
