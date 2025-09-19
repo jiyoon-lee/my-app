@@ -2,89 +2,132 @@ pipeline {
     agent any
     
     environment {
-        // Docker Hub 또는 Private Registry 설정
-        DOCKER_REGISTRY = 'jiyoon3421/my-app'
+        // 환경 변수 설정
+        DOCKER_REGISTRY = '175.45.193.234'  // Harbor 또는 Docker Hub
         DOCKER_REPO = 'my-app'
-        DOCKER_CREDENTIALS_ID = 'docker-hub-credentials'
+        DOCKER_IMAGE = "${DOCKER_REGISTRY}/my-app/nextjs-app"
         
-        // Kubernetes 설정
-        KUBECONFIG_CREDENTIALS_ID = 'kubernetes-config'
-        NAMESPACE = 'my-app'
+        // NCP 서버 정보
+        NCP_SERVER = '175.45.193.234'
+        NCP_USER = 'ubuntu'
         
-        // Git 설정
-        GIT_COMMIT_SHORT = sh(
-            script: "printf \$(git rev-parse --short HEAD)",
-            returnStdout: true
-        )
+        // Git 정보 (Windows 호환)
+        GIT_COMMIT_SHORT = ''
     }
     
     stages {
+        stage('Initialize') {
+            steps {
+                script {
+                    // Windows/Unix 환경 체크
+                    if (isUnix()) {
+                        env.GIT_COMMIT_SHORT = sh(
+                            script: "git rev-parse --short HEAD",
+                            returnStdout: true
+                        ).trim()
+                    } else {
+                        // Windows 환경에서 Git 명령어 실행
+                        env.GIT_COMMIT_SHORT = bat(
+                            script: "@echo off && for /f %%i in ('git rev-parse --short HEAD') do echo %%i",
+                            returnStdout: true
+                        ).trim()
+                    }
+                }
+                echo "🚀 빌드 시작: ${env.BRANCH_NAME} - ${env.GIT_COMMIT_SHORT}"
+            }
+        }
+        
         stage('Checkout') {
             steps {
                 checkout scm
-                echo "Building ${env.BRANCH_NAME} - ${env.GIT_COMMIT_SHORT}"
+                echo "✅ 소스코드 체크아웃 완료"
             }
         }
         
         stage('Install Dependencies') {
             steps {
                 script {
-                    sh 'npm ci'
+                    echo "📦 의존성 설치 중..."
+                    if (isUnix()) {
+                        sh 'npm ci'
+                    } else {
+                        bat 'npm ci'
+                    }
                 }
+                echo "✅ 의존성 설치 완료"
             }
         }
         
-        stage('Code Quality Check') {
+        stage('Code Quality') {
             parallel {
-                stage('Lint') {
+                stage('Lint Check') {
                     steps {
-                        sh 'npm run lint'
+                        script {
+                            echo "🔍 린트 검사 중..."
+                            if (isUnix()) {
+                                sh 'npm run lint'
+                            } else {
+                                bat 'npm run lint'
+                            }
+                        }
                     }
                 }
                 stage('Type Check') {
                     steps {
-                        sh 'npx tsc --noEmit'
+                        script {
+                            echo "📝 타입 검사 중..."
+                            if (isUnix()) {
+                                sh 'npx tsc --noEmit'
+                            } else {
+                                bat 'npx tsc --noEmit'
+                            }
+                        }
                     }
                 }
             }
         }
         
-        stage('Build Application') {
-            steps {
-                sh 'npm run build'
-            }
-        }
-        
-        stage('Build Docker Image') {
+        stage('Build') {
             steps {
                 script {
-                    def imageName = "${DOCKER_REGISTRY}/${DOCKER_REPO}:${env.GIT_COMMIT_SHORT}"
-                    def latestImage = "${DOCKER_REGISTRY}/${DOCKER_REPO}:latest"
-                    
-                    docker.build(imageName)
-                    
-                    // 최신 태그도 추가
-                    sh "docker tag ${imageName} ${latestImage}"
-                    
-                    env.DOCKER_IMAGE = imageName
+                    echo "🏗️ 애플리케이션 빌드 중..."
+                    if (isUnix()) {
+                        sh 'npm run build'
+                    } else {
+                        bat 'npm run build'
+                    }
                 }
+                echo "✅ 빌드 완료"
             }
         }
         
-        stage('Security Scan') {
+        stage('Docker Build') {
             steps {
                 script {
-                    // Trivy를 사용한 보안 스캔 (선택사항)
-                    sh """
-                        docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \\
-                        -v \$PWD/cache:/root/.cache/ \\
-                        aquasec/trivy image ${env.DOCKER_IMAGE}
-                    """
+                    def imageTag = "${env.DOCKER_IMAGE}:${env.GIT_COMMIT_SHORT}"
+                    def latestTag = "${env.DOCKER_IMAGE}:latest"
+                    
+                    echo "🐳 Docker 이미지 빌드 중..."
+                    if (isUnix()) {
+                        sh """
+                            docker build -t ${imageTag} .
+                            docker tag ${imageTag} ${latestTag}
+                        """
+                    } else {
+                        bat """
+                            docker build -t ${imageTag} .
+                            docker tag ${imageTag} ${latestTag}
+                        """
+                    }
+                    
+                    env.DOCKER_IMAGE_TAG = imageTag
+                    env.DOCKER_IMAGE_LATEST = latestTag
                 }
+                echo "✅ Docker 이미지 빌드 완료"
             }
         }
         
-        stage('Push Docker Image') {
+        stage('Push to Registry') {
             when {
                 anyOf {
                     branch 'main'
@@ -93,22 +136,28 @@ pipeline {
             }
             steps {
                 script {
-                    docker.withRegistry("https://${DOCKER_REGISTRY}", DOCKER_CREDENTIALS_ID) {
-                        sh "docker push ${env.DOCKER_IMAGE}"
-                        sh "docker push ${DOCKER_REGISTRY}/${DOCKER_REPO}:latest"
+                    echo "📤 Docker 이미지 푸시 중..."
+                    withCredentials([usernamePassword(
+                        credentialsId: 'docker-registry-credentials',
+                        usernameVariable: 'REGISTRY_USER',
+                        passwordVariable: 'REGISTRY_PASS'
+                    )]) {
+                        if (isUnix()) {
+                            sh '''
+                                echo $REGISTRY_PASS | docker login $DOCKER_REGISTRY -u $REGISTRY_USER --password-stdin
+                                docker push $DOCKER_IMAGE_TAG
+                                docker push $DOCKER_IMAGE_LATEST
+                            '''
+                        } else {
+                            bat '''
+                                echo %REGISTRY_PASS% | docker login %DOCKER_REGISTRY% -u %REGISTRY_USER% --password-stdin
+                                docker push %DOCKER_IMAGE_TAG%
+                                docker push %DOCKER_IMAGE_LATEST%
+                            '''
+                        }
                     }
                 }
-            }
-        }
-        
-        stage('Deploy to Development') {
-            when {
-                branch 'develop'
-            }
-            steps {
-                script {
-                    deployToKubernetes('development')
-                }
+                echo "✅ 이미지 푸시 완료"
             }
         }
         
@@ -118,69 +167,94 @@ pipeline {
             }
             steps {
                 script {
-                    // 프로덕션 배포 승인 요청
-                    input message: 'Deploy to Production?', ok: 'Deploy'
-                    deployToKubernetes('production')
+                    echo "🚀 NCP 서버에 배포 중..."
+                    
+                    // SSH로 NCP 서버에 배포
+                    sshagent(credentials: ['ncp-server-ssh']) {
+                        if (isUnix()) {
+                            sh '''
+                                ssh -o StrictHostKeyChecking=no $NCP_USER@$NCP_SERVER "
+                                    echo '배포 시작...'
+                                    
+                                    # Harbor/Registry 로그인
+                                    docker login $DOCKER_REGISTRY
+                                    
+                                    # 최신 이미지 가져오기
+                                    docker pull $DOCKER_IMAGE_LATEST
+                                    
+                                    # 기존 컨테이너 중지 및 제거
+                                    docker stop my-nextjs-app || true
+                                    docker rm my-nextjs-app || true
+                                    
+                                    # 새 컨테이너 실행
+                                    docker run -d \\
+                                        --name my-nextjs-app \\
+                                        --restart unless-stopped \\
+                                        -p 3000:3000 \\
+                                        -e NODE_ENV=production \\
+                                        $DOCKER_IMAGE_LATEST
+                                    
+                                    # 헬스 체크
+                                    sleep 15
+                                    curl -f http://localhost:3000/api/health || curl -f http://localhost:3000 || echo 'Health check failed'
+                                    
+                                    # 컨테이너 상태 확인
+                                    docker ps | grep my-nextjs-app
+                                    
+                                    # 이전 이미지 정리
+                                    docker image prune -f
+                                    
+                                    echo '배포 완료!'
+                                "
+                            '''
+                        } else {
+                            // Windows에서 SSH 명령어 실행
+                            bat '''
+                                ssh -o StrictHostKeyChecking=no %NCP_USER%@%NCP_SERVER% "docker pull %DOCKER_IMAGE_LATEST% && docker stop my-nextjs-app || echo ok && docker rm my-nextjs-app || echo ok && docker run -d --name my-nextjs-app --restart unless-stopped -p 3000:3000 -e NODE_ENV=production %DOCKER_IMAGE_LATEST% && sleep 10 && curl -f http://localhost:3000 && docker image prune -f"
+                            '''
+                        }
+                    }
                 }
+                echo "✅ 배포 완료!"
             }
         }
     }
     
     post {
         always {
-            // 빌드 후 정리
-            sh 'docker system prune -f'
-            
-            // 테스트 결과 보고 (테스트가 있는 경우)
-            // publishHTML([
-            //     allowMissing: false,
-            //     alwaysLinkToLastBuild: false,
-            //     keepAll: true,
-            //     reportDir: 'coverage',
-            //     reportFiles: 'index.html',
-            //     reportName: 'Coverage Report'
-            // ])
+            script {
+                echo "🧹 정리 작업 중..."
+                if (isUnix()) {
+                    sh 'docker system prune -f || true'
+                } else {
+                    bat 'docker system prune -f || echo "정리 완료"'
+                }
+            }
         }
         
         success {
-            echo 'Pipeline succeeded!'
+            echo """
+            🎉 파이프라인 성공!
+            📋 빌드 정보:
+              - 브랜치: ${env.BRANCH_NAME}
+              - 커밋: ${env.GIT_COMMIT_SHORT}
+              - 이미지: ${env.DOCKER_IMAGE_LATEST}
+              - 서버: http://${env.NCP_SERVER}
+            """
+            
             // Slack 알림 (설정된 경우)
-            // slackSend channel: '#deployments',
-            //           color: 'good',
-            //           message: "✅ ${env.JOB_NAME} - ${env.BUILD_NUMBER} succeeded"
+            // slackSend channel: '#deployments', color: 'good', message: "✅ 배포 성공: ${env.JOB_NAME} - ${env.BUILD_NUMBER}"
         }
         
         failure {
-            echo 'Pipeline failed!'
+            echo "❌ 파이프라인 실패!"
+            
             // Slack 알림 (설정된 경우)
-            // slackSend channel: '#deployments',
-            //           color: 'danger',
-            //           message: "❌ ${env.JOB_NAME} - ${env.BUILD_NUMBER} failed"
+            // slackSend channel: '#deployments', color: 'danger', message: "❌ 배포 실패: ${env.JOB_NAME} - ${env.BUILD_NUMBER}"
         }
-    }
-}
-
-def deployToKubernetes(environment) {
-    withCredentials([kubeconfigFile(credentialsId: KUBECONFIG_CREDENTIALS_ID, variable: 'KUBECONFIG')]) {
-        sh """
-            # 이미지 태그 업데이트
-            sed -i 's|image: my-app:latest|image: ${env.DOCKER_IMAGE}|g' k8s/deployment.yaml
-            
-            # Kubernetes에 배포
-            kubectl apply -f k8s/namespace.yaml
-            kubectl apply -f k8s/configmap.yaml
-            kubectl apply -f k8s/secret.yaml
-            kubectl apply -f k8s/deployment.yaml
-            kubectl apply -f k8s/service.yaml
-            kubectl apply -f k8s/ingress.yaml
-            kubectl apply -f k8s/hpa.yaml
-            
-            # 배포 상태 확인
-            kubectl rollout status deployment/my-app-deployment -n ${NAMESPACE} --timeout=300s
-            
-            # 서비스 상태 확인
-            kubectl get pods -n ${NAMESPACE}
-            kubectl get svc -n ${NAMESPACE}
-        """
+        
+        unstable {
+            echo "⚠️ 파이프라인 불안정!"
+        }
     }
 }

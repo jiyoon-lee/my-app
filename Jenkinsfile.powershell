@@ -1,0 +1,126 @@
+pipeline {
+    agent any
+    
+    environment {
+        DOCKER_REGISTRY = 'your-registry.com'
+        DOCKER_REPO = 'my-app'
+        DOCKER_CREDENTIALS_ID = 'docker-hub-credentials'
+        NCP_SERVER_HOST = '175.45.193.234'
+        NCP_SERVER_USER = 'ubuntu'
+    }
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    // PowerShell에서 Git 커밋 해시 가져오기
+                    def gitCommit = powershell(
+                        script: "git rev-parse --short HEAD",
+                        returnStdout: true
+                    ).trim()
+                    env.GIT_COMMIT_SHORT = gitCommit
+                }
+                echo "Building ${env.BRANCH_NAME} - ${env.GIT_COMMIT_SHORT}"
+            }
+        }
+        
+        stage('Install Dependencies') {
+            steps {
+                powershell 'npm ci'
+            }
+        }
+        
+        stage('Code Quality Check') {
+            parallel {
+                stage('Lint') {
+                    steps {
+                        powershell 'npm run lint'
+                    }
+                }
+                stage('Type Check') {
+                    steps {
+                        powershell 'npx tsc --noEmit'
+                    }
+                }
+            }
+        }
+        
+        stage('Build Application') {
+            steps {
+                powershell 'npm run build'
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    def imageName = "${DOCKER_REGISTRY}/${DOCKER_REPO}:${env.GIT_COMMIT_SHORT}"
+                    def latestImage = "${DOCKER_REGISTRY}/${DOCKER_REPO}:latest"
+                    
+                    powershell "docker build -t ${imageName} ."
+                    powershell "docker tag ${imageName} ${latestImage}"
+                    
+                    env.DOCKER_IMAGE = imageName
+                }
+            }
+        }
+        
+        stage('Push Docker Image') {
+            when {
+                anyOf {
+                    branch 'main'
+                    branch 'develop'
+                }
+            }
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: DOCKER_CREDENTIALS_ID, usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                        powershell """
+                            echo \$env:DOCKER_PASS | docker login ${DOCKER_REGISTRY} -u \$env:DOCKER_USER --password-stdin
+                            docker push ${env.DOCKER_IMAGE}
+                            docker push ${DOCKER_REGISTRY}/${DOCKER_REPO}:latest
+                        """
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy to NCP Server') {
+            when {
+                branch 'main'
+            }
+            steps {
+                script {
+                    // SSH를 통한 배포 (Windows에서 실행)
+                    powershell """
+                        # SSH 키를 사용하여 NCP 서버에 배포 명령 실행
+                        ssh -o StrictHostKeyChecking=no ${NCP_SERVER_USER}@${NCP_SERVER_HOST} "
+                            docker pull ${env.DOCKER_IMAGE}
+                            docker stop my-app || true
+                            docker rm my-app || true
+                            docker run -d --name my-app --restart unless-stopped -p 3000:3000 -e NODE_ENV=production ${env.DOCKER_IMAGE}
+                            sleep 10
+                            curl -f http://localhost:3000/api/health || curl -f http://localhost:3000
+                            docker image prune -f
+                        "
+                    """
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            powershell 'docker system prune -f'
+        }
+        
+        success {
+            echo '✅ Windows Pipeline succeeded!'
+        }
+        
+        failure {
+            echo '❌ Windows Pipeline failed!'
+        }
+    }
+}
