@@ -3,32 +3,29 @@ pipeline {
     
     environment {
         // 환경 변수 설정
-        DOCKER_REGISTRY = '175.45.193.234'  // Harbor 또는 Docker Hub
+        DOCKER_REGISTRY = '175.45.193.234'  // Harbor 또는 본인의 Registry
         DOCKER_REPO = 'my-app'
-        DOCKER_IMAGE = "${DOCKER_REGISTRY}/my-app/nextjs-app"
+        DOCKER_IMAGE = "${DOCKER_REGISTRY}/${DOCKER_REPO}/nextjs-app"
         
         // NCP 서버 정보
         NCP_SERVER = '175.45.193.234'
         NCP_USER = 'ubuntu'
-        
-        // Git 정보 (Windows 호환)
-        GIT_COMMIT_SHORT = ''
     }
     
     stages {
         stage('Initialize') {
             steps {
                 script {
-                    // Windows/Unix 환경 체크
+                    // Windows에서 Git 커밋 해시 가져오기
                     if (isUnix()) {
                         env.GIT_COMMIT_SHORT = sh(
                             script: "git rev-parse --short HEAD",
                             returnStdout: true
                         ).trim()
                     } else {
-                        // Windows 환경에서 Git 명령어 실행
-                        env.GIT_COMMIT_SHORT = bat(
-                            script: "@echo off && for /f %%i in ('git rev-parse --short HEAD') do echo %%i",
+                        // Windows용 - PowerShell 사용
+                        env.GIT_COMMIT_SHORT = powershell(
+                            script: "git rev-parse --short HEAD",
                             returnStdout: true
                         ).trim()
                     }
@@ -51,7 +48,8 @@ pipeline {
                     if (isUnix()) {
                         sh 'npm ci'
                     } else {
-                        bat 'npm ci'
+                        // Windows용 - PowerShell 사용
+                        powershell 'npm ci'
                     }
                 }
                 echo "✅ 의존성 설치 완료"
@@ -67,7 +65,7 @@ pipeline {
                             if (isUnix()) {
                                 sh 'npm run lint'
                             } else {
-                                bat 'npm run lint'
+                                powershell 'npm run lint'
                             }
                         }
                     }
@@ -79,7 +77,7 @@ pipeline {
                             if (isUnix()) {
                                 sh 'npx tsc --noEmit'
                             } else {
-                                bat 'npx tsc --noEmit'
+                                powershell 'npx tsc --noEmit'
                             }
                         }
                     }
@@ -94,7 +92,7 @@ pipeline {
                     if (isUnix()) {
                         sh 'npm run build'
                     } else {
-                        bat 'npm run build'
+                        powershell 'npm run build'
                     }
                 }
                 echo "✅ 빌드 완료"
@@ -114,7 +112,7 @@ pipeline {
                             docker tag ${imageTag} ${latestTag}
                         """
                     } else {
-                        bat """
+                        powershell """
                             docker build -t ${imageTag} .
                             docker tag ${imageTag} ${latestTag}
                         """
@@ -132,6 +130,7 @@ pipeline {
                 anyOf {
                     branch 'main'
                     branch 'develop'
+                    branch 'master'
                 }
             }
             steps {
@@ -149,10 +148,10 @@ pipeline {
                                 docker push $DOCKER_IMAGE_LATEST
                             '''
                         } else {
-                            bat '''
-                                echo %REGISTRY_PASS% | docker login %DOCKER_REGISTRY% -u %REGISTRY_USER% --password-stdin
-                                docker push %DOCKER_IMAGE_TAG%
-                                docker push %DOCKER_IMAGE_LATEST%
+                            powershell '''
+                                echo $env:REGISTRY_PASS | docker login $env:DOCKER_REGISTRY -u $env:REGISTRY_USER --password-stdin
+                                docker push $env:DOCKER_IMAGE_TAG
+                                docker push $env:DOCKER_IMAGE_LATEST
                             '''
                         }
                     }
@@ -163,7 +162,10 @@ pipeline {
         
         stage('Deploy to Production') {
             when {
-                branch 'main'
+                anyOf {
+                    branch 'main'
+                    branch 'master'
+                }
             }
             steps {
                 script {
@@ -176,7 +178,7 @@ pipeline {
                                 ssh -o StrictHostKeyChecking=no $NCP_USER@$NCP_SERVER "
                                     echo '배포 시작...'
                                     
-                                    # Harbor/Registry 로그인
+                                    # Registry 로그인
                                     docker login $DOCKER_REGISTRY
                                     
                                     # 최신 이미지 가져오기
@@ -209,8 +211,16 @@ pipeline {
                             '''
                         } else {
                             // Windows에서 SSH 명령어 실행
-                            bat '''
-                                ssh -o StrictHostKeyChecking=no %NCP_USER%@%NCP_SERVER% "docker pull %DOCKER_IMAGE_LATEST% && docker stop my-nextjs-app || echo ok && docker rm my-nextjs-app || echo ok && docker run -d --name my-nextjs-app --restart unless-stopped -p 3000:3000 -e NODE_ENV=production %DOCKER_IMAGE_LATEST% && sleep 10 && curl -f http://localhost:3000 && docker image prune -f"
+                            powershell '''
+                                ssh -o StrictHostKeyChecking=no $env:NCP_USER@$env:NCP_SERVER @"
+                                docker pull $env:DOCKER_IMAGE_LATEST
+                                docker stop my-nextjs-app 2>null; docker rm my-nextjs-app 2>null
+                                docker run -d --name my-nextjs-app --restart unless-stopped -p 3000:3000 -e NODE_ENV=production $env:DOCKER_IMAGE_LATEST
+                                sleep 10
+                                curl -f http://localhost:3000 || echo 'App starting...'
+                                docker image prune -f
+                                echo 'Deploy completed!'
+"@
                             '''
                         }
                     }
@@ -227,7 +237,7 @@ pipeline {
                 if (isUnix()) {
                     sh 'docker system prune -f || true'
                 } else {
-                    bat 'docker system prune -f || echo "정리 완료"'
+                    powershell 'try { docker system prune -f } catch { Write-Host "정리 완료" }'
                 }
             }
         }
@@ -241,16 +251,10 @@ pipeline {
               - 이미지: ${env.DOCKER_IMAGE_LATEST}
               - 서버: http://${env.NCP_SERVER}
             """
-            
-            // Slack 알림 (설정된 경우)
-            // slackSend channel: '#deployments', color: 'good', message: "✅ 배포 성공: ${env.JOB_NAME} - ${env.BUILD_NUMBER}"
         }
         
         failure {
-            echo "❌ 파이프라인 실패!"
-            
-            // Slack 알림 (설정된 경우)
-            // slackSend channel: '#deployments', color: 'danger', message: "❌ 배포 실패: ${env.JOB_NAME} - ${env.BUILD_NUMBER}"
+            echo "❌ 파이프라인 실패! 로그를 확인하세요."
         }
         
         unstable {

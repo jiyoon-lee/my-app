@@ -1,0 +1,47 @@
+pipeline {
+    agent any
+    
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                echo "✅ 소스코드 체크아웃 완료"
+            }
+        }
+        
+        stage('Install Dependencies') {
+            steps {
+                script {
+                    if (isUnix()) {
+                        sh 'npm ci'
+                    } else {
+                        powershell 'npm ci'
+                    }
+                }
+                echo "✅ 의존성 설치 완료"
+            }
+        }
+        
+        stage('Build') {
+            steps {
+                script {
+                    if (isUnix()) {
+                        sh 'npm run build'
+                    } else {
+                        powershell 'npm run build'
+                    }
+                }
+                echo "✅ 빌드 완료"
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo "🎉 빌드 성공!"
+        }
+        failure {
+            echo "❌ 빌드 실패!"
+        }
+    }
+}
